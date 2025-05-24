@@ -1,6 +1,6 @@
 import os
 import cv2
-from flask import Flask, request, redirect, url_for, render_template, jsonify
+from flask import Flask, request, redirect, url_for, render_template, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 
 # Configuration Constants
@@ -173,20 +173,73 @@ def detect_k_line_candles(original_image_path, processed_image_path, processed_i
                 else:
                     color_label = 'indeterminate_roi_out_of_bounds' # Mapped ROI was outside original image
                 
+                # Wick Detection Logic (on processed_img)
+                wick_high_y = py
+                wick_low_y = py + ph
+                candle_center_x = px + pw // 2
+
+                # Ensure candle_center_x is within image bounds
+                if candle_center_x >= processed_img_width:
+                    candle_center_x = processed_img_width -1
+                
+                # Upper Wick Scan (scan from body top upwards)
+                # Consider a small horizontal window for robustness
+                scan_width = max(1, pw // 8) # Scan width, e.g., 1/8 of body width
+                x_start_scan = max(0, candle_center_x - scan_width // 2)
+                x_end_scan = min(processed_img_width, candle_center_x + scan_width // 2 + 1)
+
+                # Define a threshold for wick pixels (e.g., darker than a value, assuming light background)
+                # This threshold is critical and may need to be adaptive or tuned.
+                # For now, let's use a relatively dark threshold (e.g., < 100 for 8-bit grayscale)
+                # or check if it's significantly darker than the area just above the body.
+                # A simpler approach: if the body is dark, wicks are dark. If light, wicks are light.
+                # This is complex. Let's use a fixed threshold for now on the grayscale image.
+                wick_pixel_threshold = 150 # Pixels darker than this are potentially part of a wick line
+
+                for y_scan in range(py - 1, -1, -1): # Scan upwards
+                    is_wick_pixel_found = False
+                    # Check pixels in the horizontal scan window
+                    for x_s in range(x_start_scan, x_end_scan):
+                        if processed_img[y_scan, x_s] < wick_pixel_threshold:
+                            is_wick_pixel_found = True
+                            break
+                    if is_wick_pixel_found:
+                        wick_high_y = y_scan
+                    else: # Line broken
+                        break 
+                
+                # Lower Wick Scan (scan from body bottom downwards)
+                for y_scan in range(py + ph, processed_img_height): # Scan downwards
+                    is_wick_pixel_found = False
+                    for x_s in range(x_start_scan, x_end_scan):
+                        if processed_img[y_scan, x_s] < wick_pixel_threshold:
+                            is_wick_pixel_found = True
+                            break
+                    if is_wick_pixel_found:
+                        wick_low_y = y_scan
+                    else: # Line broken
+                        break
+
                 detected_candles.append({
-                    'x': px, 'y': py, 'width': pw, 'height': ph, # Store processed image coordinates
+                    'body_x': px, 'body_y': py, 'body_w': pw, 'body_h': ph,
+                    'wick_high_y': wick_high_y,
+                    'wick_low_y': wick_low_y,
+                    'upper_shadow_length': py - wick_high_y,
+                    'lower_shadow_length': wick_low_y - (py + ph),
                     'color_label': color_label
                 })
     return detected_candles
 
-def identify_simple_patterns(detected_candles, processed_image_height):
+def identify_candle_patterns(detected_candles, processed_image_height):
     """
-    Identifies simple K-line patterns ("Big Yang Line", "Big Yin Line")
-    from a list of detected candles.
+    Identifies various single K-line patterns from a list of detected candles.
+    Includes Big Yang/Yin, Doji, Hammer, Hanging Man, Inverted Hammer, Shooting Star.
+    The distinction between Hammer/Hanging Man and Inv Hammer/Shooting Star is based
+    on shape and color for now; trend context is not yet considered.
 
     Args:
         detected_candles (list): A list of candle dictionaries, each produced by
-                                 `detect_k_line_candles`.
+                                 `detect_k_line_candles` (must include wick info).
         processed_image_height (int): The height of the processed image, used for
                                       relative size comparisons.
 
@@ -195,48 +248,202 @@ def identify_simple_patterns(detected_candles, processed_image_height):
               identified pattern (pattern_name, description, candles_involved).
     """
     patterns = []
-    # Threshold for a "big" candle body, relative to the processed image height (e.g., 5% of image height)
-    big_candle_threshold = processed_image_height * 0.05
 
-    for candle in detected_candles:
-        candle_height = candle['height'] # Height of the candle in the processed image
-        pattern_info = None
+    # --- Thresholds and Ratios for Pattern Recognition (Sensible Defaults - May Need Tuning) ---
 
-        # Identify Big Yang Line (strong bullish)
-        if candle['color_label'] == 'up_candle' and candle_height > big_candle_threshold:
-            pattern_info = {
-                "pattern_name": "Big Yang Line",
-                "description": "A strong bullish candle indicating buying pressure. The body is long and green (or white).",
-                "candles_involved": [{ # List of candles forming this pattern (here, just one)
-                    'x': candle['x'], 'y': candle['y'], 
-                    'width': candle['width'], 'height': candle['height'],
-                    'color_label': candle['color_label']
-                }]
-            }
-        # Identify Big Yin Line (strong bearish)
-        elif candle['color_label'] == 'down_candle' and candle_height > big_candle_threshold:
-            pattern_info = {
-                "pattern_name": "Big Yin Line",
-                "description": "A strong bearish candle indicating selling pressure. The body is long and red (or black).",
-                "candles_involved": [{
-                    'x': candle['x'], 'y': candle['y'], 
-                    'width': candle['width'], 'height': candle['height'],
-                    'color_label': candle['color_label']
-                }]
-            }
+    # For Big Yang/Yin: Body height relative to processed image height.
+    big_candle_body_min_ratio_to_image = 0.05 
+
+    # For Doji: Max body height relative to total candle range (high-low).
+    doji_body_max_ratio_to_total_range = 0.1 
+
+    # For Hammer & Hanging Man:
+    hammer_body_max_ratio_to_total_range = 0.33  # Body is max 1/3 of total candle range.
+    hammer_lower_shadow_min_ratio_to_body = 2.0  # Lower shadow at least 2x body height.
+    hammer_upper_shadow_max_ratio_to_body = 1.0  # Upper shadow no more than 1x body height (relatively small).
+
+    # For Inverted Hammer & Shooting Star:
+    inv_hammer_body_max_ratio_to_total_range = 0.33 # Body is max 1/3 of total candle range.
+    inv_hammer_upper_shadow_min_ratio_to_body = 2.0 # Upper shadow at least 2x body height.
+    inv_hammer_lower_shadow_max_ratio_to_body = 1.0 # Lower shadow no more than 1x body height.
+    
+    # Minimum total range (pixels) for a candle to be considered for Doji/Hammer type patterns.
+    # This helps avoid classifying noise or very small, insignificant candles.
+    min_total_range_for_complex_pattern_px = processed_image_height * 0.01 # e.g. 1% of image height
+
+    # --- Thresholds for Two-Candle Patterns ---
+    # Engulfing: No specific ratio for body size, just strict engulfment.
+    # Tweezer Tops/Bottoms: Max difference in highs/lows.
+    # This can be a fixed pixel value or a ratio of average candle height.
+    # Using a small pixel value for now, e.g., 2-3 pixels, assuming STANDAR_WIDTH is 1000px.
+    # A more robust way would be relative to candle size or volatility.
+    tweezer_max_diff_px = processed_image_height * 0.003 # 0.3% of image height, e.g., 3px if height is 1000px
+                                                         # This is a very strict threshold.
+
+    # Sort candles by their horizontal position ('body_x') to process them in chart order.
+    # This is crucial for two-candle pattern detection.
+    sorted_candles = sorted(detected_candles, key=lambda c: c['body_x'])
+    
+    num_candles = len(sorted_candles)
+
+    # --- Single-Candle Pattern Identification ---
+    for i in range(num_candles):
+        candle = sorted_candles[i]
+        body_h = candle['body_h']
+        upper_shadow = candle['upper_shadow_length']
+        lower_shadow = candle['lower_shadow_length']
+        color = candle['color_label']
         
-        if pattern_info:
-            patterns.append(pattern_info)
+        total_range = body_h + upper_shadow + lower_shadow
+
+        # --- Pattern Identification Logic ---
+
+        # 1. Big Yang Line
+        if color == 'up_candle' and body_h > (processed_image_height * big_candle_body_min_ratio_to_image):
+            patterns.append({
+                "pattern_name": "Big Yang Line",
+                "description": "A strong bullish candle indicating buying pressure. The body is long and typically green/white.",
+                "candles_involved": [candle]
+            })
+            continue # A Big Yang is usually not also a Doji/Hammer etc.
+
+        # 2. Big Yin Line
+        if color == 'down_candle' and body_h > (processed_image_height * big_candle_body_min_ratio_to_image):
+            patterns.append({
+                "pattern_name": "Big Yin Line",
+                "description": "A strong bearish candle indicating selling pressure. The body is long and typically red/black.",
+                "candles_involved": [candle]
+            })
+            continue # A Big Yin is usually not also a Doji/Hammer etc.
+
+        # Proceed with other patterns only if the candle has a significant total range
+        if total_range < min_total_range_for_complex_pattern_px and \
+           not (patterns and patterns[-1]["pattern_name"] in ["Big Yang Line", "Big Yin Line"]): # Avoid skipping if Big Yang/Yin was just added
+            # If a Big Yang/Yin was identified, we already 'continue'd for that candle.
+            # This 'continue' is for candles that are NOT Big Yang/Yin AND are too small for other complex patterns.
+            if not any(p_info["candles_involved"][0] == candle for p_info in patterns if p_info["pattern_name"] in ["Big Yang Line", "Big Yin Line"]):
+                 continue
+
+
+        # 3. Doji
+        # Condition: Body height is very small compared to the total candle range.
+        is_doji_body = (body_h / total_range) < doji_body_max_ratio_to_total_range if total_range > 0 else body_h < (processed_image_height *0.005) # very small body if no range
+        if is_doji_body:
+            patterns.append({
+                "pattern_name": "Doji",
+                "description": "Indecision in the market. Open and close prices are very close, resulting in a small body. Color is less significant.",
+                "candles_involved": [candle]
+            })
+            # Doji is a primary classification; usually don't classify as Hammer/etc. if it's a clear Doji.
+            # However, some Doji (like Dragonfly/Gravestone) can overlap with Hammer/ShootingStar shapes.
+            # For now, if it's a Doji, we might skip other shape-based ones or make them less likely.
+            # Let's allow other classifications for now, but this could be refined.
+
+        # 4. Hammer / Hanging Man (shape-based first)
+        is_hammer_shape_body_small = (body_h / total_range) < hammer_body_max_ratio_to_total_range if total_range > 0 else False
+        is_hammer_shape_lower_shadow_long = lower_shadow >= (hammer_lower_shadow_min_ratio_to_body * body_h) if body_h > 0 else lower_shadow > (total_range * 0.6) # if body is tiny, lower shadow is most of candle
+        is_hammer_shape_upper_shadow_short = upper_shadow < (hammer_upper_shadow_max_ratio_to_body * body_h) if body_h > 0 else upper_shadow < (total_range * 0.3) # if body is tiny, upper shadow is small part
+
+        if is_hammer_shape_body_small and is_hammer_shape_lower_shadow_long and is_hammer_shape_upper_shadow_short:
+            if color == 'up_candle' or color == 'indeterminate_gray' or color == 'indeterminate_mixed_color': # Typically bullish body for Hammer
+                patterns.append({
+                    "pattern_name": "Hammer",
+                    "description": "Potential bullish reversal signal. Small body near the top, long lower shadow, very short or no upper shadow. Typically appears after a downtrend.",
+                    "candles_involved": [candle]
+                })
+            else: # 'down_candle' or 'indeterminate_dark'
+                patterns.append({
+                    "pattern_name": "Hanging Man",
+                    "description": "Potential bearish reversal signal if after an uptrend. Shape is like a Hammer (small body, long lower shadow, short upper shadow), but color can be bearish.",
+                    "candles_involved": [candle]
+                })
+
+        # 5. Inverted Hammer / Shooting Star (shape-based first)
+        is_inv_hammer_shape_body_small = (body_h / total_range) < inv_hammer_body_max_ratio_to_total_range if total_range > 0 else False
+        is_inv_hammer_shape_upper_shadow_long = upper_shadow >= (inv_hammer_upper_shadow_min_ratio_to_body * body_h) if body_h > 0 else upper_shadow > (total_range * 0.6)
+        is_inv_hammer_shape_lower_shadow_short = lower_shadow < (inv_hammer_lower_shadow_max_ratio_to_body * body_h) if body_h > 0 else lower_shadow < (total_range * 0.3)
+
+        if is_inv_hammer_shape_body_small and is_inv_hammer_shape_upper_shadow_long and is_inv_hammer_shape_lower_shadow_short:
+            if color == 'up_candle' or color == 'indeterminate_gray' or color == 'indeterminate_mixed_color': # Typically bullish body for Inverted Hammer
+                patterns.append({
+                    "pattern_name": "Inverted Hammer",
+                    "description": "Potential bullish reversal signal. Small body near the bottom, long upper shadow, very short or no lower shadow. Typically appears after a downtrend.",
+                    "candles_involved": [candle]
+                })
+            else: # 'down_candle' or 'indeterminate_dark'
+                patterns.append({
+                    "pattern_name": "Shooting Star",
+                    "description": "Potential bearish reversal signal if after an uptrend. Shape is like an Inverted Hammer (small body, long upper shadow, short lower shadow), but color can be bearish.",
+                    "candles_involved": [candle]
+                })
+            
+    
+    # --- Two-Candle Pattern Identification ---
+    # Iterate up to the second to last candle to compare candle[i] with candle[i+1]
+    for i in range(num_candles - 1):
+        c1 = sorted_candles[i]  # First candle
+        c2 = sorted_candles[i+1] # Second candle
+
+        # 1. Bullish Engulfing
+        if c1['color_label'] == 'down_candle' and c2['color_label'] == 'up_candle':
+            # Second candle's body must engulf the first candle's body
+            if (c2['body_y'] < c1['body_y']) and \
+               ((c2['body_y'] + c2['body_h']) > (c1['body_y'] + c1['body_h'])):
+                patterns.append({
+                    "pattern_name": "Bullish Engulfing",
+                    "description": "A potential bullish reversal signal. A smaller bearish candle is engulfed by a larger bullish candle.",
+                    "candles_involved": [c1, c2]
+                })
+
+        # 2. Bearish Engulfing
+        elif c1['color_label'] == 'up_candle' and c2['color_label'] == 'down_candle':
+            # Second candle's body must engulf the first candle's body
+            if (c2['body_y'] < c1['body_y']) and \
+               ((c2['body_y'] + c2['body_h']) > (c1['body_y'] + c1['body_h'])):
+                patterns.append({
+                    "pattern_name": "Bearish Engulfing",
+                    "description": "A potential bearish reversal signal. A smaller bullish candle is engulfed by a larger bearish candle.",
+                    "candles_involved": [c1, c2]
+                })
+        
+        # 3. Tweezer Top
+        # Highs are nearly identical. Using wick_high_y which is the absolute highest point.
+        # c1['wick_high_y'] is the y-coordinate of the highest point of candle 1. Lower y means higher on chart.
+        if abs(c1['wick_high_y'] - c2['wick_high_y']) <= tweezer_max_diff_px:
+            # Optionally, add color/trend context, e.g., c1 bullish, c2 bearish after uptrend
+            patterns.append({
+                "pattern_name": "Tweezer Top",
+                "description": "Potential bearish reversal. Two consecutive candles with nearly identical highs.",
+                "candles_involved": [c1, c2]
+            })
+
+        # 4. Tweezer Bottom
+        # Lows are nearly identical. Using wick_low_y which is the absolute lowest point.
+        # c1['wick_low_y'] is the y-coordinate of the lowest point of candle 1. Higher y means lower on chart.
+        if abs(c1['wick_low_y'] - c2['wick_low_y']) <= tweezer_max_diff_px:
+            # Optionally, add color/trend context
+            patterns.append({
+                "pattern_name": "Tweezer Bottom",
+                "description": "Potential bullish reversal. Two consecutive candles with nearly identical lows.",
+                "candles_involved": [c1, c2]
+            })
             
     return patterns
 
 @app.route('/', methods=['GET'])
-def upload_form():
+def index():
     """
-    Serves the HTML page with the file upload form.
-    This route is for basic testing and demonstration via a web browser.
+    Serves the main HTML page (index.html) for the application.
     """
-    return render_template('upload.html')
+    return render_template('index.html')
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    """
+    Serves uploaded files from the UPLOAD_FOLDER.
+    This allows the frontend to display uploaded and processed images.
+    """
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -308,7 +515,7 @@ def upload_file():
         # response_dict["detected_candles_details"] = detected_candles 
 
         # Identify patterns
-        identified_patterns = identify_simple_patterns(detected_candles, processed_h)
+        identified_patterns = identify_candle_patterns(detected_candles, processed_h) # Changed function name
         response_dict["identified_patterns"] = identified_patterns
         
         if not response_dict["errors"]: # If errors were empty until now

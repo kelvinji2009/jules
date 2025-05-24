@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>K-Line Chart Analysis</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }
+        #container { max-width: 900px; margin: auto; }
+        #uploadedImage { max-width: 100%; height: auto; margin-top: 20px; border: 1px solid #ccc; }
+        .results-section, .error-section, .disclaimer-section {
+            margin-top: 20px; padding: 10px; border: 1px solid #eee; border-radius: 5px;
+        }
+        .results-section h3, .error-section h3 { margin-top: 0; }
+        .pattern { margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid #f0f0f0; }
+        .pattern:last-child { border-bottom: none; }
+        .pattern-name { font-weight: bold; }
+        .candle-details { margin-left: 20px; font-size: 0.9em; }
+        .error-messages { color: red; }
+        .disclaimer-text { font-size: 0.8em; color: #555; }
+        #loadingSpinner {
+            display: none; /* Hidden by default */
+            width: 40px;
+            height: 40px;
+            border: 4px solid #f3f3f3; /* Light grey */
+            border-top: 4px solid #3498db; /* Blue */
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <h1>K-Line Chart Analysis Tool</h1>
+
+        <input type="file" id="imageUpload" accept="image/png, image/jpeg, image/gif">
+        <button id="submitBtn">Analyze Image</button>
+        <div id="loadingSpinner"></div>
+
+        <div id="errorMessages" class="error-section" style="display: none;">
+            <h3>Errors</h3>
+            <div class="error-messages-content"></div>
+        </div>
+        
+        <h2>Uploaded Image:</h2>
+        <img id="uploadedImage" src="#" alt="Uploaded K-Line Chart" style="display:none;">
+
+        <div id="analysisResults" class="results-section" style="display: none;">
+            <h3>Analysis Results</h3>
+            <div class="analysis-content"></div>
+        </div>
+
+        <div class="disclaimer-section">
+            <h3>Disclaimer</h3>
+            <p id="disclaimerText" class="disclaimer-text">Loading disclaimer...</p>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('submitBtn').addEventListener('click', async function() {
+            const imageUpload = document.getElementById('imageUpload');
+            const uploadedImage = document.getElementById('uploadedImage');
+            const analysisResultsDiv = document.getElementById('analysisResults');
+            const analysisContent = analysisResultsDiv.querySelector('.analysis-content');
+            const errorMessagesDiv = document.getElementById('errorMessages');
+            const errorMessagesContent = errorMessagesDiv.querySelector('.error-messages-content');
+            const disclaimerTextP = document.getElementById('disclaimerText');
+            const loadingSpinner = document.getElementById('loadingSpinner');
+
+            // Clear previous results and hide sections
+            uploadedImage.style.display = 'none';
+            analysisResultsDiv.style.display = 'none';
+            analysisContent.innerHTML = '';
+            errorMessagesDiv.style.display = 'none';
+            errorMessagesContent.innerHTML = '';
+            loadingSpinner.style.display = 'block';
+
+
+            if (imageUpload.files.length === 0) {
+                errorMessagesContent.innerHTML = 'Please select an image file to upload.';
+                errorMessagesDiv.style.display = 'block';
+                loadingSpinner.style.display = 'none';
+                return;
+            }
+
+            const file = imageUpload.files[0];
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+                loadingSpinner.style.display = 'none';
+
+                // Display disclaimer
+                if (data.disclaimer) {
+                    disclaimerTextP.textContent = data.disclaimer;
+                } else {
+                    disclaimerTextP.textContent = "Disclaimer not available.";
+                }
+                
+                if (data.errors && data.errors.length > 0) {
+                    errorMessagesContent.innerHTML = data.errors.join('<br>');
+                    errorMessagesDiv.style.display = 'block';
+                } else {
+                    errorMessagesDiv.style.display = 'none'; // Ensure errors are hidden if successful
+                }
+
+                if (data.processed_filename) {
+                    // Use a timestamp to prevent browser caching if the same filename is processed multiple times
+                    uploadedImage.src = `/uploads/${data.processed_filename}?t=${new Date().getTime()}`;
+                    uploadedImage.style.display = 'block';
+                } else if (data.filename && data.errors && data.errors.length > 0) {
+                    // If there was an error but an original filename exists, maybe show it if applicable
+                    // For now, only showing processed_filename
+                     uploadedImage.src = `/uploads/${data.filename}?t=${new Date().getTime()}`; // Show original if processed failed but original was saved
+                     uploadedImage.style.display = 'block';
+                }
+
+
+                if (data.identified_patterns && data.identified_patterns.length > 0) {
+                    let patternsHTML = `<h4>Detected Patterns (${data.detected_candles_count} potential candles found):</h4>`;
+                    data.identified_patterns.forEach(pattern => {
+                        patternsHTML += `<div class="pattern">`;
+                        patternsHTML += `<p class="pattern-name">${pattern.pattern_name}</p>`;
+                        patternsHTML += `<p>${pattern.description}</p>`;
+                        if (pattern.candles_involved && pattern.candles_involved.length > 0) {
+                            patternsHTML += `<p>Candles Involved:</p><ul class="candle-details">`;
+                            pattern.candles_involved.forEach(candle => {
+                                patternsHTML += `<li>Color: ${candle.color_label}, Body: [x:${candle.body_x}, y:${candle.body_y}, w:${candle.body_w}, h:${candle.body_h}], Upper Shadow: ${candle.upper_shadow_length}, Lower Shadow: ${candle.lower_shadow_length} (High Y: ${candle.wick_high_y}, Low Y: ${candle.wick_low_y})</li>`;
+                            });
+                            patternsHTML += `</ul>`;
+                        }
+                        patternsHTML += `</div>`;
+                    });
+                    analysisContent.innerHTML = patternsHTML;
+                    analysisResultsDiv.style.display = 'block';
+                } else if (!(data.errors && data.errors.length > 0)) { // Only show "no patterns" if no errors
+                    analysisContent.innerHTML = `<p>Detected Candles: ${data.detected_candles_count}. No specific advanced patterns were identified.</p>`;
+                    analysisResultsDiv.style.display = 'block';
+                }
+
+
+            } catch (error) {
+                loadingSpinner.style.display = 'none';
+                errorMessagesContent.innerHTML = `An unexpected error occurred: ${error.message}. Please check the console.`;
+                errorMessagesDiv.style.display = 'block';
+                disclaimerTextP.textContent = "Disclaimer not available due to error.";
+                console.error('Fetch error:', error);
+            }
+        });
+    </script>
+</body>
+</html>
